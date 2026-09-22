@@ -9,6 +9,11 @@
 
 use std::fmt;
 
+// The shared `Missing` prefix is intentional, not an oversight: all three
+// variants are the same underlying condition (something required wasn't
+// present), and that shared vocabulary is clearer here than inventing
+// three unrelated-sounding names just to satisfy the lint.
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum FrontmatterError {
     MissingOpeningDelimiter,
