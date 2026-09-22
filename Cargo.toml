@@ -1,0 +1,8 @@
+[package]
+name = "aivyx-skills"
+description = "Default, system-level SKILL.md-format skill library shared by Aivyx PA and aivyx-coder"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
