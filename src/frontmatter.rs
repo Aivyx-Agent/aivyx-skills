@@ -41,7 +41,10 @@ impl std::error::Error for FrontmatterError {}
 
 /// Parses a full `SKILL.md` file's contents into `(name, description,
 /// body)`. `body` is the markdown content after the closing `---`, with
-/// leading blank lines trimmed (trailing content is preserved as-is).
+/// leading blank lines trimmed. Any `\r\n` line endings (frontmatter or
+/// body) are normalized to `\n` first, so `body`'s line endings may
+/// differ from the raw input even though its text content is otherwise
+/// unchanged.
 pub(crate) fn parse_skill_md(raw: &str) -> Result<(String, String, String), FrontmatterError> {
     // Normalize CRLF to LF up front so every delimiter/line check below --
     // in the frontmatter block AND the body -- works identically whether
