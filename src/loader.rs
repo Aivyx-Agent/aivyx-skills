@@ -39,16 +39,29 @@ pub struct SkillSummary {
 }
 
 #[derive(Default)]
-pub struct SkillLoader {}
+pub struct SkillLoader {
+    project_dir: Option<std::path::PathBuf>,
+    user_dir: Option<std::path::PathBuf>,
+}
 
 impl SkillLoader {
     pub fn new() -> Self {
         Self::default()
     }
 
+    pub fn with_project_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.project_dir = Some(dir);
+        self
+    }
+
+    pub fn with_user_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.user_dir = Some(dir);
+        self
+    }
+
     pub fn list(&self) -> Vec<SkillSummary> {
-        bundled_skills()
-            .into_iter()
+        self.resolve_all()
+            .into_values()
             .map(|s| SkillSummary {
                 name: s.name,
                 description: s.description,
@@ -58,7 +71,30 @@ impl SkillLoader {
     }
 
     pub fn get(&self, name: &str) -> Option<Skill> {
-        bundled_skills().into_iter().find(|s| s.name == name)
+        self.resolve_all().remove(name)
+    }
+
+    /// Builds the full, priority-resolved skill map: bundled first, then
+    /// user overrides, then project overrides -- each later source
+    /// replacing any earlier entry with the same name in the
+    /// `HashMap`, so project always wins over user, which always wins
+    /// over bundled.
+    fn resolve_all(&self) -> std::collections::HashMap<String, Skill> {
+        let mut skills = std::collections::HashMap::new();
+        for skill in bundled_skills() {
+            skills.insert(skill.name.clone(), skill);
+        }
+        if let Some(dir) = &self.user_dir {
+            for skill in overlay_skills(dir, SkillSource::User) {
+                skills.insert(skill.name.clone(), skill);
+            }
+        }
+        if let Some(dir) = &self.project_dir {
+            for skill in overlay_skills(dir, SkillSource::Project) {
+                skills.insert(skill.name.clone(), skill);
+            }
+        }
+        skills
     }
 }
 
@@ -89,6 +125,45 @@ fn bundled_skills() -> Vec<Skill> {
             description,
             body,
             source: SkillSource::Bundled,
+        });
+    }
+    skills
+}
+
+/// Scans `dir` for `<name>/SKILL.md` entries, skipping (not erroring on)
+/// anything that fails to parse or whose frontmatter `name` doesn't
+/// match its own directory name -- unlike bundled skills, these come
+/// from outside this crate's control, so a malformed one degrades
+/// gracefully rather than panicking. A `dir` that doesn't exist, or any
+/// other read error, is silently treated as "no skills from this
+/// source."
+fn overlay_skills(dir: &std::path::Path, source: SkillSource) -> Vec<Skill> {
+    let mut skills = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return skills;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Ok(raw) = std::fs::read_to_string(path.join("SKILL.md")) else {
+            continue;
+        };
+        let Ok((name, description, body)) = parse_skill_md(&raw) else {
+            continue;
+        };
+        if name != dir_name {
+            continue;
+        }
+        skills.push(Skill {
+            name,
+            description,
+            body,
+            source: source.clone(),
         });
     }
     skills
@@ -157,5 +232,120 @@ mod tests {
     fn get_returns_none_for_an_unknown_name() {
         let loader = SkillLoader::new();
         assert!(loader.get("does-not-exist").is_none());
+    }
+
+    #[test]
+    fn a_missing_project_dir_is_treated_as_no_overrides() {
+        let loader = SkillLoader::new().with_project_dir(std::path::PathBuf::from(
+            "/nonexistent/path/that/does/not/exist",
+        ));
+        let summaries = loader.list();
+        assert_eq!(
+            summaries.len(),
+            5,
+            "a missing project dir must not error or change the bundled count"
+        );
+    }
+
+    #[test]
+    fn a_project_dir_skill_overrides_a_bundled_skill_of_the_same_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join("systematic-debugging");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: systematic-debugging\ndescription: A project-local override.\n---\n\nOverridden body.\n",
+        )
+        .unwrap();
+
+        let loader = SkillLoader::new().with_project_dir(dir.path().to_path_buf());
+        let skill = loader.get("systematic-debugging").unwrap();
+        assert_eq!(skill.source, SkillSource::Project);
+        assert_eq!(skill.description, "A project-local override.");
+        assert_eq!(skill.body, "Overridden body.\n");
+
+        let summaries = loader.list();
+        assert_eq!(
+            summaries.len(),
+            5,
+            "an override replaces, it doesn't add a duplicate entry"
+        );
+    }
+
+    #[test]
+    fn a_project_dir_override_wins_over_a_user_dir_override_of_the_same_name() {
+        let project_dir = tempfile::tempdir().unwrap();
+        let user_dir = tempfile::tempdir().unwrap();
+
+        for (dir, description) in [(&project_dir, "from project"), (&user_dir, "from user")] {
+            let skill_dir = dir.path().join("clear-communication");
+            std::fs::create_dir_all(&skill_dir).unwrap();
+            std::fs::write(
+                skill_dir.join("SKILL.md"),
+                format!(
+                    "---\nname: clear-communication\ndescription: {description}.\n---\n\nBody.\n"
+                ),
+            )
+            .unwrap();
+        }
+
+        let loader = SkillLoader::new()
+            .with_user_dir(user_dir.path().to_path_buf())
+            .with_project_dir(project_dir.path().to_path_buf());
+        let skill = loader.get("clear-communication").unwrap();
+        assert_eq!(skill.source, SkillSource::Project);
+        assert_eq!(skill.description, "from project.");
+    }
+
+    #[test]
+    fn a_new_skill_in_an_overlay_dir_is_added_not_just_used_for_overrides() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join("a-brand-new-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: a-brand-new-skill\ndescription: Not one of the bundled five.\n---\n\nBody.\n",
+        )
+        .unwrap();
+
+        let loader = SkillLoader::new().with_project_dir(dir.path().to_path_buf());
+        let summaries = loader.list();
+        assert_eq!(summaries.len(), 6);
+        assert!(loader.get("a-brand-new-skill").is_some());
+    }
+
+    #[test]
+    fn a_malformed_overlay_skill_is_skipped_not_treated_as_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join("broken-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), "not valid frontmatter at all").unwrap();
+
+        let loader = SkillLoader::new().with_project_dir(dir.path().to_path_buf());
+        let summaries = loader.list();
+        assert_eq!(
+            summaries.len(),
+            5,
+            "a malformed overlay skill must be silently skipped"
+        );
+        assert!(loader.get("broken-skill").is_none());
+    }
+
+    #[test]
+    fn an_overlay_skill_whose_name_does_not_match_its_directory_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join("the-directory-name");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: a-different-name\ndescription: Mismatched on purpose.\n---\n\nBody.\n",
+        )
+        .unwrap();
+
+        let loader = SkillLoader::new().with_project_dir(dir.path().to_path_buf());
+        let summaries = loader.list();
+        assert_eq!(summaries.len(), 5);
+        assert!(loader.get("the-directory-name").is_none());
+        assert!(loader.get("a-different-name").is_none());
     }
 }
