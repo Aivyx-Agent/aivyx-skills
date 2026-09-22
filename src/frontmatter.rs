@@ -43,6 +43,11 @@ impl std::error::Error for FrontmatterError {}
 /// body)`. `body` is the markdown content after the closing `---`, with
 /// leading blank lines trimmed (trailing content is preserved as-is).
 pub(crate) fn parse_skill_md(raw: &str) -> Result<(String, String, String), FrontmatterError> {
+    // Normalize CRLF to LF up front so every delimiter/line check below --
+    // in the frontmatter block AND the body -- works identically whether
+    // the file was authored/checked-out with `\n` or `\r\n` line endings.
+    let raw = raw.replace("\r\n", "\n");
+
     let after_open = raw
         .strip_prefix("---\n")
         .ok_or(FrontmatterError::MissingOpeningDelimiter)?;
@@ -105,6 +110,15 @@ mod tests {
         let (name, description, _) = parse_skill_md(raw).unwrap();
         assert_eq!(name, "a-skill");
         assert_eq!(description, "A description.");
+    }
+
+    #[test]
+    fn tolerates_crlf_line_endings() {
+        let raw = "---\r\nname: systematic-debugging\r\ndescription: A structured methodology.\r\n---\r\n\r\n# Systematic Debugging\r\n\r\nBody text here.\r\n";
+        let (name, description, body) = parse_skill_md(raw).unwrap();
+        assert_eq!(name, "systematic-debugging");
+        assert_eq!(description, "A structured methodology.");
+        assert_eq!(body, "# Systematic Debugging\n\nBody text here.\n");
     }
 
     #[test]

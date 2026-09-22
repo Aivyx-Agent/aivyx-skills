@@ -12,10 +12,11 @@ use crate::frontmatter::parse_skill_md;
 #[folder = "skills/"]
 struct BundledSkills;
 
-/// Who a resolved `Skill`/`SkillSummary` came from -- `Project` and
-/// `User` only ever appear once `SkillLoader::with_project_dir`/
-/// `with_user_dir` are used (Task 3); this task only ever produces
-/// `Bundled`.
+/// Which of the three possible locations a resolved `Skill`/
+/// `SkillSummary` was loaded from: compiled into the binary (`Bundled`),
+/// a per-user overlay directory (`User`), or a per-project overlay
+/// directory (`Project`). See `SkillLoader::resolve_all` for the
+/// priority order these are merged in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SkillSource {
     Bundled,
@@ -23,6 +24,8 @@ pub enum SkillSource {
     Project,
 }
 
+/// A fully-resolved skill, including its markdown `body` -- what
+/// `SkillLoader::get` returns for a single, known-needed skill.
 #[derive(Debug, Clone)]
 pub struct Skill {
     pub name: String,
@@ -31,6 +34,10 @@ pub struct Skill {
     pub source: SkillSource,
 }
 
+/// A lightweight, `body`-free view of a skill -- just enough to describe
+/// it (e.g. for injection into a system prompt as a discovery list) and
+/// to know which name to pass to `SkillLoader::get` for the full skill.
+/// See `SkillLoader::list`.
 #[derive(Debug, Clone)]
 pub struct SkillSummary {
     pub name: String,
@@ -38,6 +45,10 @@ pub struct SkillSummary {
     pub source: SkillSource,
 }
 
+/// Resolves the default library of `SKILL.md`-format skills: the 5
+/// skills bundled into this crate at compile time, merged with an
+/// optional caller-provided project and/or user overlay directory
+/// (project overrides user overrides bundled, per same-named skill).
 #[derive(Default)]
 pub struct SkillLoader {
     project_dir: Option<std::path::PathBuf>,
@@ -45,31 +56,59 @@ pub struct SkillLoader {
 }
 
 impl SkillLoader {
+    /// Creates a loader with no overlay directories -- bundled skills
+    /// only, until `with_project_dir`/`with_user_dir` are attached.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Attaches a project overlay directory. `dir` must directly contain
+    /// one subdirectory per skill, each holding a `SKILL.md` file (e.g.
+    /// `dir/my-skill/SKILL.md`) -- the same shape as this crate's own
+    /// bundled `skills/` directory. Do not pass a project root or any
+    /// other directory that doesn't directly contain skill
+    /// subdirectories: it will silently yield zero overlays, not an
+    /// error. A `dir` that doesn't exist is likewise treated as "no
+    /// overrides from this source," not an error.
     pub fn with_project_dir(mut self, dir: std::path::PathBuf) -> Self {
         self.project_dir = Some(dir);
         self
     }
 
+    /// Attaches a user overlay directory. Same expected shape and
+    /// same-directory-vs-root pitfall as `with_project_dir`: `dir` must
+    /// directly contain one subdirectory per skill, each holding a
+    /// `SKILL.md` file (e.g. `dir/my-skill/SKILL.md`). A nonexistent
+    /// `dir` is treated as "no overrides from this source," not an
+    /// error.
     pub fn with_user_dir(mut self, dir: std::path::PathBuf) -> Self {
         self.user_dir = Some(dir);
         self
     }
 
+    /// Lists every resolved skill as a cheap, `body`-free `SkillSummary`
+    /// (name + description only). The returned `Vec` is always sorted by
+    /// `name`, deterministically, so repeated calls across runs produce
+    /// an identical ordering -- this matters because callers typically
+    /// inject this list into an LLM system prompt, where a reshuffling
+    /// order would defeat prompt-prefix caching.
     pub fn list(&self) -> Vec<SkillSummary> {
-        self.resolve_all()
+        let mut summaries: Vec<SkillSummary> = self
+            .resolve_all()
             .into_values()
             .map(|s| SkillSummary {
                 name: s.name,
                 description: s.description,
                 source: s.source,
             })
-            .collect()
+            .collect();
+        summaries.sort_by(|a, b| a.name.cmp(&b.name));
+        summaries
     }
 
+    /// Returns the fully-resolved skill (including `body`) for one name,
+    /// applying project > user > bundled priority, or `None` if no
+    /// source has a skill with that name.
     pub fn get(&self, name: &str) -> Option<Skill> {
         self.resolve_all().remove(name)
     }
@@ -205,6 +244,37 @@ mod tests {
             assert!(!skill.description.is_empty());
             assert!(!skill.body.is_empty());
         }
+    }
+
+    /// Hardening test for the `debug-embed` fix: proves the bundled set
+    /// is genuinely non-empty, not just correctly-shaped, so a
+    /// regression (e.g. someone reverting the `debug-embed` feature, or
+    /// any other build misconfiguration that makes `rust-embed` fall
+    /// back to reading a stale absolute filesystem path) fails loudly
+    /// here instead of silently shipping a library with zero skills.
+    #[test]
+    fn bundled_skills_is_never_empty() {
+        assert!(
+            !bundled_skills().is_empty(),
+            "bundled_skills() returned zero skills -- rust-embed likely isn't embedding \
+             content in this build (check the `debug-embed` feature in Cargo.toml)"
+        );
+    }
+
+    /// Regression guard for deterministic ordering: `list()` must return
+    /// its summaries sorted by name, every time, so repeated calls
+    /// (including across separate process runs) produce an identical
+    /// ordering for system-prompt injection / KV-cache prefix reuse.
+    #[test]
+    fn list_is_sorted_by_name() {
+        let loader = SkillLoader::new();
+        let names: Vec<String> = loader.list().into_iter().map(|s| s.name).collect();
+        let mut sorted_names = names.clone();
+        sorted_names.sort();
+        assert_eq!(
+            names, sorted_names,
+            "list() must return summaries sorted by name"
+        );
     }
 
     #[test]
