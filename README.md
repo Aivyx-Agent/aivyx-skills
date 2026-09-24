@@ -62,4 +62,4 @@ if let Some(skill) = loader.get("systematic-debugging") {
 
 ## License
 
-Dual-licensed under Apache-2.0 OR MIT — see `LICENSE`.
+Source-available under BUSL-1.1 — see `LICENSE`.
