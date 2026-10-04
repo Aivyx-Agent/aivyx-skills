@@ -175,7 +175,11 @@ fn bundled_skills() -> Vec<Skill> {
 /// from outside this crate's control, so a malformed one degrades
 /// gracefully rather than panicking. A `dir` that doesn't exist, or any
 /// other read error, is silently treated as "no skills from this
-/// source."
+/// source." `SKILL.md` itself is read via `read_bounded_regular_file`,
+/// which also skips (rather than hangs or unboundedly reads) anything
+/// that isn't a plain regular file within a fixed byte cap -- see its
+/// own doc comment. In aivyx-coder, this scan runs on every turn, so
+/// every entry here must resolve quickly.
 fn overlay_skills(dir: &std::path::Path, source: SkillSource) -> Vec<Skill> {
     let mut skills = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -189,7 +193,7 @@ fn overlay_skills(dir: &std::path::Path, source: SkillSource) -> Vec<Skill> {
         let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        let Ok(raw) = std::fs::read_to_string(path.join("SKILL.md")) else {
+        let Some(raw) = read_bounded_regular_file(&path.join("SKILL.md")) else {
             continue;
         };
         let Ok((name, description, body)) = parse_skill_md(&raw) else {
@@ -206,6 +210,81 @@ fn overlay_skills(dir: &std::path::Path, source: SkillSource) -> Vec<Skill> {
         });
     }
     skills
+}
+
+/// Maximum number of bytes `read_bounded_regular_file` will read from a
+/// single overlay `SKILL.md` before giving up and skipping it. Generous
+/// for genuine skill content (the 5 bundled skills are a few KiB each)
+/// but small enough that even reading right up to the cap is cheap.
+const MAX_SKILL_MD_BYTES: u64 = 256 * 1024;
+
+/// Reads `path` as an overlay `SKILL.md`, but only if it is -- or is a
+/// symlink to -- a plain regular file, and only up to
+/// [`MAX_SKILL_MD_BYTES`] bytes. Returns `None` (after logging a
+/// warning) instead of reading at all for anything else: a FIFO, a
+/// device node, a socket, a symlink to one of those, or a regular file
+/// over the cap.
+///
+/// Overlay directories are user- or project-provided, so `SKILL.md`
+/// there is not necessarily what it looks like. Two failure modes this
+/// specifically guards against: a `SKILL.md` that is a symlink to an
+/// endless device (`/dev/zero`), which plain `read_to_string` would read
+/// until memory runs out, and one that is a FIFO with no writer, which
+/// `File::open` for reading blocks on forever. Checking the file type
+/// with `symlink_metadata`/`metadata` *before* ever opening the path
+/// avoids both: the FIFO is never opened (so never blocks), and the
+/// device is never read (so never grows unbounded). The byte cap is
+/// enforced with `Read::take`, which keeps working even if the file
+/// grows while being read, since it counts bytes actually read rather
+/// than trusting the file's reported size up front.
+fn read_bounded_regular_file(path: &std::path::Path) -> Option<String> {
+    // `symlink_metadata` reports on `path` itself without following a
+    // final symlink. If `path` is a symlink, resolve what it points at
+    // with `metadata` (which does follow) to learn the real target's
+    // type -- still without ever opening it.
+    let link_meta = std::fs::symlink_metadata(path).ok()?;
+    let target_meta = if link_meta.is_symlink() {
+        std::fs::metadata(path).ok()?
+    } else {
+        link_meta
+    };
+    if !target_meta.is_file() {
+        eprintln!(
+            "aivyx-skills: skipping {} -- not a regular file (or a symlink to one)",
+            path.display()
+        );
+        return None;
+    }
+
+    let file = std::fs::File::open(path).ok()?;
+    let mut buf = Vec::new();
+    // `take(cap + 1)` lets us distinguish "read exactly the cap" from
+    // "read past it" in one pass, without trusting the file's metadata
+    // size (which could be stale, e.g. if the file grows concurrently).
+    {
+        use std::io::Read;
+        file.take(MAX_SKILL_MD_BYTES + 1)
+            .read_to_end(&mut buf)
+            .ok()?;
+    }
+    if buf.len() as u64 > MAX_SKILL_MD_BYTES {
+        eprintln!(
+            "aivyx-skills: skipping {} -- exceeds the {MAX_SKILL_MD_BYTES}-byte SKILL.md cap",
+            path.display()
+        );
+        return None;
+    }
+
+    match String::from_utf8(buf) {
+        Ok(s) => Some(s),
+        Err(_) => {
+            eprintln!(
+                "aivyx-skills: skipping {} -- not valid UTF-8",
+                path.display()
+            );
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -417,5 +496,134 @@ mod tests {
         assert_eq!(summaries.len(), 5);
         assert!(loader.get("the-directory-name").is_none());
         assert!(loader.get("a-different-name").is_none());
+    }
+
+    /// Runs `f` on a background thread and waits up to `timeout` for it to
+    /// finish, panicking instead of hanging if it doesn't. Used by the
+    /// bounded-read tests below so a regression (loader blocking forever
+    /// on a FIFO, or ballooning memory on a device symlink) fails the test
+    /// quickly instead of hanging the whole suite.
+    #[cfg(unix)]
+    fn with_timeout<T: Send + 'static>(
+        timeout: std::time::Duration,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(timeout).expect(
+            "operation did not complete within the timeout -- likely hung reading a \
+             FIFO/device instead of skipping it",
+        )
+    }
+
+    /// Creates a FIFO (named pipe) at `path` via `libc::mkfifo`. A `File::open`
+    /// on this path for reading blocks forever until something else opens it
+    /// for writing -- exactly the hang this crate's loader must avoid by
+    /// never opening a non-regular-file `SKILL.md`.
+    #[cfg(unix)]
+    fn mkfifo(path: &std::path::Path) {
+        let c_path = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        let ret = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(ret, 0, "mkfifo failed: {}", std::io::Error::last_os_error());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_skill_md_symlinked_to_a_device_is_skipped_quickly_and_siblings_still_load() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let bad_skill_dir = dir.path().join("device-skill");
+        std::fs::create_dir_all(&bad_skill_dir).unwrap();
+        std::os::unix::fs::symlink("/dev/zero", bad_skill_dir.join("SKILL.md")).unwrap();
+
+        let good_skill_dir = dir.path().join("normal-skill");
+        std::fs::create_dir_all(&good_skill_dir).unwrap();
+        std::fs::write(
+            good_skill_dir.join("SKILL.md"),
+            "---\nname: normal-skill\ndescription: A normal skill next to a bad one.\n---\n\nBody.\n",
+        )
+        .unwrap();
+
+        let loader = SkillLoader::new().with_project_dir(dir.path().to_path_buf());
+        let summaries = with_timeout(std::time::Duration::from_secs(10), move || loader.list());
+
+        assert!(
+            summaries.iter().any(|s| s.name == "normal-skill"),
+            "the normal sibling skill must still load: {summaries:?}"
+        );
+        assert!(
+            !summaries.iter().any(|s| s.name == "device-skill"),
+            "a SKILL.md symlinked to a device must be skipped, not loaded: {summaries:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_skill_md_that_is_a_fifo_is_skipped_quickly_and_siblings_still_load() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let bad_skill_dir = dir.path().join("fifo-skill");
+        std::fs::create_dir_all(&bad_skill_dir).unwrap();
+        mkfifo(&bad_skill_dir.join("SKILL.md"));
+
+        let good_skill_dir = dir.path().join("normal-skill");
+        std::fs::create_dir_all(&good_skill_dir).unwrap();
+        std::fs::write(
+            good_skill_dir.join("SKILL.md"),
+            "---\nname: normal-skill\ndescription: A normal skill next to a bad one.\n---\n\nBody.\n",
+        )
+        .unwrap();
+
+        let loader = SkillLoader::new().with_project_dir(dir.path().to_path_buf());
+        let summaries = with_timeout(std::time::Duration::from_secs(10), move || loader.list());
+
+        assert!(
+            summaries.iter().any(|s| s.name == "normal-skill"),
+            "the normal sibling skill must still load: {summaries:?}"
+        );
+        assert!(
+            !summaries.iter().any(|s| s.name == "fifo-skill"),
+            "a SKILL.md that is a FIFO must be skipped, not loaded: {summaries:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_over_cap_skill_md_is_skipped_quickly_and_siblings_still_load() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let bad_skill_dir = dir.path().join("huge-skill");
+        std::fs::create_dir_all(&bad_skill_dir).unwrap();
+        // Otherwise perfectly valid frontmatter -- this must be rejected
+        // for being too big, not for any other reason (an invalid/absent
+        // frontmatter would be skipped anyway and wouldn't actually prove
+        // the byte cap is doing anything).
+        let mut oversized =
+            "---\nname: huge-skill\ndescription: A huge but otherwise valid skill.\n---\n\n"
+                .to_string();
+        oversized.push_str(&"x".repeat(300 * 1024));
+        std::fs::write(bad_skill_dir.join("SKILL.md"), oversized).unwrap();
+
+        let good_skill_dir = dir.path().join("normal-skill");
+        std::fs::create_dir_all(&good_skill_dir).unwrap();
+        std::fs::write(
+            good_skill_dir.join("SKILL.md"),
+            "---\nname: normal-skill\ndescription: A normal skill next to a bad one.\n---\n\nBody.\n",
+        )
+        .unwrap();
+
+        let loader = SkillLoader::new().with_project_dir(dir.path().to_path_buf());
+        let summaries = with_timeout(std::time::Duration::from_secs(10), move || loader.list());
+
+        assert!(
+            summaries.iter().any(|s| s.name == "normal-skill"),
+            "the normal sibling skill must still load: {summaries:?}"
+        );
+        assert!(
+            !summaries.iter().any(|s| s.name == "huge-skill"),
+            "a SKILL.md over the byte cap must be skipped, not loaded: {summaries:?}"
+        );
     }
 }
