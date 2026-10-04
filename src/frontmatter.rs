@@ -6,6 +6,24 @@
 //! matching this workspace's established preference for keeping small
 //! shared crates dependency-light (see `aivyx-injection-guard`'s own
 //! "no dependencies -- pure std").
+//!
+//! Supported scalar styles for `name`/`description` (see
+//! `README.md`'s "SKILL.md frontmatter format" section for the
+//! user-facing version of this list):
+//! - Plain, unquoted (`description: A description.`).
+//! - Double-quoted (`description: "A description."`), with `\"` and
+//!   `\\` unescaped.
+//! - Single-quoted (`description: 'A description.'`), quotes stripped,
+//!   no escape processing.
+//! - Folded block scalar (`description: >`, continuation lines indented
+//!   on following lines), joined into one line with spaces.
+//! - Literal block scalar (`description: |`, continuation lines
+//!   indented on following lines), joined with `\n`, preserving line
+//!   breaks.
+//!
+//! The closing `---` delimiter may or may not be followed by a trailing
+//! newline -- a file that ends exactly at `---` with no final `\n` is
+//! accepted (with an empty body), not rejected.
 
 use std::fmt;
 
@@ -55,26 +73,56 @@ pub(crate) fn parse_skill_md(raw: &str) -> Result<(String, String, String), Fron
         .strip_prefix("---\n")
         .ok_or(FrontmatterError::MissingOpeningDelimiter)?;
 
-    let close_pos = after_open
-        .find("\n---\n")
-        .ok_or(FrontmatterError::MissingClosingDelimiter)?;
-
-    let frontmatter_block = &after_open[..close_pos];
-    let rest = &after_open[close_pos + "\n---\n".len()..];
+    // The closing `---` is normally followed by a newline (and then the
+    // body); but a file that ends exactly at the closing `---`, with no
+    // final `\n` at all, is also valid -- it just has an empty body.
+    let (frontmatter_block, rest) = if let Some(pos) = after_open.find("\n---\n") {
+        (&after_open[..pos], &after_open[pos + "\n---\n".len()..])
+    } else if let Some(stripped) = after_open.strip_suffix("\n---") {
+        (stripped, "")
+    } else {
+        return Err(FrontmatterError::MissingClosingDelimiter);
+    };
 
     let mut name = None;
     let mut description = None;
-    for line in frontmatter_block.lines() {
-        let line = line.trim();
+    let mut lines = frontmatter_block.lines().peekable();
+    while let Some(raw_line) = lines.next() {
+        let line = raw_line.trim();
         if line.is_empty() {
             continue;
         }
-        let Some((key, value)) = line.split_once(':') else {
+        let Some((key, raw_value)) = line.split_once(':') else {
             continue;
         };
-        match key.trim() {
-            "name" => name = Some(value.trim().to_string()),
-            "description" => description = Some(value.trim().to_string()),
+        let key = key.trim();
+        let raw_value = raw_value.trim();
+
+        // `>` (folded) and `|` (literal) introduce a YAML block scalar:
+        // the actual content is on the following, more-indented lines,
+        // not after the colon on this line. Any key's block scalar gets
+        // consumed here (not just name/description's) so its
+        // continuation lines are never mistaken for separate `key:
+        // value` lines on the next loop iteration.
+        let value = if raw_value == ">" || raw_value == "|" {
+            let mut continuation_lines = Vec::new();
+            while let Some(next_line) = lines.peek() {
+                let is_indented = next_line.trim_start().len() != next_line.len();
+                if !is_indented || next_line.trim().is_empty() {
+                    break;
+                }
+                continuation_lines.push(next_line.trim().to_string());
+                lines.next();
+            }
+            let separator = if raw_value == ">" { " " } else { "\n" };
+            continuation_lines.join(separator)
+        } else {
+            unquote(raw_value)
+        };
+
+        match key {
+            "name" => name = Some(value),
+            "description" => description = Some(value),
             _ => {}
         }
     }
@@ -84,6 +132,40 @@ pub(crate) fn parse_skill_md(raw: &str) -> Result<(String, String, String), Fron
     let body = rest.trim_start_matches('\n').to_string();
 
     Ok((name, description, body))
+}
+
+/// Strips a single- or double-quoted YAML scalar's surrounding quotes.
+/// A double-quoted value also has `\"` and `\\` unescaped -- the only
+/// two escapes this deliberately-minimal parser supports (see the
+/// module doc comment). A value that isn't quoted at all, or is quoted
+/// on only one side, is returned unchanged, quote characters and all.
+fn unquote(value: &str) -> String {
+    if let Some(inner) = value.strip_prefix('"').and_then(|v| v.strip_suffix('"')) {
+        let mut out = String::with_capacity(inner.len());
+        let mut chars = inner.chars();
+        while let Some(c) = chars.next() {
+            if c != '\\' {
+                out.push(c);
+                continue;
+            }
+            match chars.next() {
+                Some('"') => out.push('"'),
+                Some('\\') => out.push('\\'),
+                Some(other) => {
+                    // Not a recognized escape -- keep the backslash
+                    // literally rather than silently dropping it.
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        }
+        out
+    } else if let Some(inner) = value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')) {
+        inner.to_string()
+    } else {
+        value.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -158,5 +240,57 @@ mod tests {
             parse_skill_md(raw).unwrap_err(),
             FrontmatterError::MissingField("description")
         );
+    }
+
+    #[test]
+    fn double_quoted_scalars_are_unquoted_and_unescaped() {
+        let raw = r#"---
+name: a-skill
+description: "A \"quoted\" value with a backslash: \\."
+---
+
+Body.
+"#;
+        let (_, description, _) = parse_skill_md(raw).unwrap();
+        assert_eq!(description, "A \"quoted\" value with a backslash: \\.");
+    }
+
+    #[test]
+    fn single_quoted_scalars_are_unquoted() {
+        let raw = r#"---
+name: a-skill
+description: 'A single-quoted value.'
+---
+
+Body.
+"#;
+        let (_, description, _) = parse_skill_md(raw).unwrap();
+        assert_eq!(description, "A single-quoted value.");
+    }
+
+    #[test]
+    fn folded_block_scalar_description_joins_lines_with_spaces() {
+        let raw = "---\nname: a-skill\ndescription: >\n  This is a folded\n  description split\n  across lines.\n---\n\nBody.\n";
+        let (_, description, _) = parse_skill_md(raw).unwrap();
+        assert_eq!(
+            description,
+            "This is a folded description split across lines."
+        );
+    }
+
+    #[test]
+    fn literal_block_scalar_description_preserves_newlines() {
+        let raw = "---\nname: a-skill\ndescription: |\n  Line one.\n  Line two.\n---\n\nBody.\n";
+        let (_, description, _) = parse_skill_md(raw).unwrap();
+        assert_eq!(description, "Line one.\nLine two.");
+    }
+
+    #[test]
+    fn a_closing_delimiter_with_no_trailing_newline_is_accepted() {
+        let raw = "---\nname: a-skill\ndescription: A description.\n---";
+        let (name, description, body) = parse_skill_md(raw).unwrap();
+        assert_eq!(name, "a-skill");
+        assert_eq!(description, "A description.");
+        assert_eq!(body, "");
     }
 }

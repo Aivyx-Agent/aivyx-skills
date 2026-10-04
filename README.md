@@ -48,13 +48,44 @@ if let Some(skill) = loader.get("systematic-debugging") {
 }
 ```
 
+## SKILL.md frontmatter format
+
+The frontmatter parser is a deliberately minimal, dependency-free
+line-based parser for exactly two required scalar fields (`name`,
+`description`) — not a general YAML parser. Supported scalar styles:
+
+- Plain, unquoted: `description: A description.`
+- Double-quoted: `description: "A description."` — the surrounding
+  quotes are stripped, and `\"` / `\\` are unescaped (the only two
+  escapes supported).
+- Single-quoted: `description: 'A description.'` — the surrounding
+  quotes are stripped, with no escape processing.
+- Folded block scalar: `description: >` followed by one or more
+  more-indented continuation lines, joined into a single line with
+  spaces.
+- Literal block scalar: `description: |` followed by one or more
+  more-indented continuation lines, joined with `\n`, preserving line
+  breaks.
+
+The closing `---` delimiter may or may not be followed by a trailing
+newline — a file that ends exactly at `---` with no final `\n` is
+accepted (with an empty body), not rejected. Unknown frontmatter fields
+(anything besides `name`/`description`) are tolerated and ignored.
+
+Each overlay `SKILL.md` is only read if it is a regular file (a
+symlink to one is fine; a symlink to a device or a FIFO is skipped, not
+opened) and only up to a 256 KiB cap — see `read_bounded_regular_file`
+in `src/loader.rs`. A skipped entry logs a warning and is simply absent
+from `list()`/`get()`, same as any other malformed overlay skill.
+
 ## Known limitations
 
 - Overlay directories read arbitrary local filesystem content. This
-  crate does not treat that content as untrusted — whichever repo
+  crate does not treat that *content* as untrusted — whichever repo
   eventually builds the Part 2/3 consumption code should decide whether
   overlay skill content needs sanitizing before it's injected into an
-  LLM context.
+  LLM context. (This is distinct from the file-*type*/size robustness
+  above, which this crate does handle itself.)
 - `SkillLoader` re-scans and re-parses everything (bundled + overlays) on
   every `list()`/`get()` call; there's no caching. Fine at today's scale
   (5 bundled skills plus a small overlay), but worth revisiting if this
