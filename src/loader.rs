@@ -221,42 +221,43 @@ const MAX_SKILL_MD_BYTES: u64 = 256 * 1024;
 /// Reads `path` as an overlay `SKILL.md`, but only if it is -- or is a
 /// symlink to -- a plain regular file, and only up to
 /// [`MAX_SKILL_MD_BYTES`] bytes. Returns `None` (after logging a
-/// warning) instead of reading at all for anything else: a FIFO, a
-/// device node, a socket, a symlink to one of those, or a regular file
-/// over the cap.
+/// warning via `tracing`) instead of reading at all for anything else:
+/// a FIFO, a device node, a socket, a symlink to one of those, or a
+/// regular file over the cap.
 ///
 /// Overlay directories are user- or project-provided, so `SKILL.md`
 /// there is not necessarily what it looks like. Two failure modes this
 /// specifically guards against: a `SKILL.md` that is a symlink to an
 /// endless device (`/dev/zero`), which plain `read_to_string` would read
 /// until memory runs out, and one that is a FIFO with no writer, which
-/// `File::open` for reading blocks on forever. Checking the file type
-/// with `symlink_metadata`/`metadata` *before* ever opening the path
-/// avoids both: the FIFO is never opened (so never blocks), and the
-/// device is never read (so never grows unbounded). The byte cap is
-/// enforced with `Read::take`, which keeps working even if the file
-/// grows while being read, since it counts bytes actually read rather
-/// than trusting the file's reported size up front.
+/// a plain, blocking `File::open` for reading would block on forever.
+///
+/// The type check is deliberately NOT "check the path's metadata, then
+/// separately open the path" -- that has a TOCTOU gap: the path could
+/// be swapped for a FIFO between the check and the open, and a plain
+/// `File::open` on it would then block forever regardless of what the
+/// earlier check saw. Instead, `open_nonblocking` opens with
+/// `O_NONBLOCK` (so even a FIFO with no writer can't block the open
+/// call itself), and only then is the *opened file descriptor's own*
+/// metadata (`file.metadata()`, an fstat, not a path-based stat) checked
+/// for being a regular file. `O_NONBLOCK` makes no behavioral difference
+/// for a genuine regular file, which is the only thing ever read past
+/// this point. The byte cap is enforced with `Read::take`, which keeps
+/// working even if the file grows while being read, since it counts
+/// bytes actually read rather than trusting the file's reported size up
+/// front.
 fn read_bounded_regular_file(path: &std::path::Path) -> Option<String> {
-    // `symlink_metadata` reports on `path` itself without following a
-    // final symlink. If `path` is a symlink, resolve what it points at
-    // with `metadata` (which does follow) to learn the real target's
-    // type -- still without ever opening it.
-    let link_meta = std::fs::symlink_metadata(path).ok()?;
-    let target_meta = if link_meta.is_symlink() {
-        std::fs::metadata(path).ok()?
-    } else {
-        link_meta
-    };
-    if !target_meta.is_file() {
-        eprintln!(
-            "aivyx-skills: skipping {} -- not a regular file (or a symlink to one)",
-            path.display()
+    let file = open_nonblocking(path).ok()?;
+
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() {
+        tracing::warn!(
+            path = %path.display(),
+            "aivyx-skills: skipping SKILL.md -- not a regular file (or a symlink to one)"
         );
         return None;
     }
 
-    let file = std::fs::File::open(path).ok()?;
     let mut buf = Vec::new();
     // `take(cap + 1)` lets us distinguish "read exactly the cap" from
     // "read past it" in one pass, without trusting the file's metadata
@@ -268,9 +269,10 @@ fn read_bounded_regular_file(path: &std::path::Path) -> Option<String> {
             .ok()?;
     }
     if buf.len() as u64 > MAX_SKILL_MD_BYTES {
-        eprintln!(
-            "aivyx-skills: skipping {} -- exceeds the {MAX_SKILL_MD_BYTES}-byte SKILL.md cap",
-            path.display()
+        tracing::warn!(
+            path = %path.display(),
+            cap = MAX_SKILL_MD_BYTES,
+            "aivyx-skills: skipping SKILL.md -- exceeds the byte cap"
         );
         return None;
     }
@@ -278,13 +280,36 @@ fn read_bounded_regular_file(path: &std::path::Path) -> Option<String> {
     match String::from_utf8(buf) {
         Ok(s) => Some(s),
         Err(_) => {
-            eprintln!(
-                "aivyx-skills: skipping {} -- not valid UTF-8",
-                path.display()
+            tracing::warn!(
+                path = %path.display(),
+                "aivyx-skills: skipping SKILL.md -- not valid UTF-8"
             );
             None
         }
     }
+}
+
+/// Opens `path` for reading with `O_NONBLOCK` set on Unix, so opening a
+/// FIFO with no writer on the other end returns immediately instead of
+/// blocking (reading from it is never attempted either way -- see
+/// `read_bounded_regular_file`'s doc comment for why this closes a
+/// check-then-open race that a separate pre-open metadata check can't).
+/// `O_NONBLOCK` has no effect on opening or reading a regular file. On
+/// non-Unix targets, falls back to a plain `File::open` -- `O_NONBLOCK`
+/// is a POSIX-only concept, and this crate has no FIFO-specific concern
+/// to guard against there.
+#[cfg(unix)]
+fn open_nonblocking(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_nonblocking(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(path)
 }
 
 #[cfg(test)]
@@ -322,6 +347,50 @@ mod tests {
             assert_eq!(skill.source, SkillSource::Bundled);
             assert!(!skill.description.is_empty());
             assert!(!skill.body.is_empty());
+        }
+    }
+
+    /// Pins every bundled skill's exact `name` and `description` text,
+    /// not just its presence/shape (as
+    /// `all_bundled_skills_parse_and_match_their_directory_name` above
+    /// already does) -- so a frontmatter-parser change that silently
+    /// mangles a value (e.g. mis-handling the embedded `"..."` and `'`
+    /// characters in `systematic-debugging`'s own description) fails
+    /// loudly here instead of only being caught by eyeballing a diff.
+    #[test]
+    fn bundled_skill_descriptions_are_pinned_exactly() {
+        let expected: &[(&str, &str)] = &[
+            (
+                "brainstorming-and-scoping",
+                "Use before starting any non-trivial request -- turn a vague or ambiguous ask into a validated, scoped plan through short back-and-forth dialogue, before taking any real action.",
+            ),
+            (
+                "clear-communication",
+                "Use whenever producing user-facing text -- a message, a summary, a report, documentation -- to keep it clear, concrete, and no longer than it needs to be.",
+            ),
+            (
+                "self-review-before-done",
+                "Use before declaring any non-trivial task finished -- critically check the actual result against what was actually asked for, rather than against what you intended to produce.",
+            ),
+            (
+                "systematic-debugging",
+                "Use when investigating a bug, an unexpected result, or any \"this should have worked and didn't\" situation -- a structured reproduce/isolate/hypothesize/verify methodology that resists the urge to guess-and-check.",
+            ),
+            (
+                "writing-plans",
+                "Use after a design or approach has been agreed on, before starting real implementation work -- break it into small, concrete, independently-verifiable steps instead of working from the design directly.",
+            ),
+        ];
+
+        let loader = SkillLoader::new();
+        for (name, description) in expected {
+            let skill = loader
+                .get(name)
+                .unwrap_or_else(|| panic!("expected bundled skill {name:?} to exist"));
+            assert_eq!(
+                &skill.description, description,
+                "bundled skill {name:?}'s description changed unexpectedly"
+            );
         }
     }
 
@@ -586,6 +655,53 @@ mod tests {
         assert!(
             !summaries.iter().any(|s| s.name == "fifo-skill"),
             "a SKILL.md that is a FIFO must be skipped, not loaded: {summaries:?}"
+        );
+    }
+
+    /// Mechanism-level regression test for the check-then-open race fix:
+    /// `open_nonblocking` must actually set `O_NONBLOCK` on the fd it
+    /// returns, not just happen to work on a plain regular file. A plain
+    /// `File::open` (the pre-fix behavior) would fail this, since it
+    /// never sets the flag at all.
+    #[cfg(unix)]
+    #[test]
+    fn open_nonblocking_sets_the_o_nonblock_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("SKILL.md");
+        std::fs::write(&path, "content").unwrap();
+
+        let file = open_nonblocking(&path).unwrap();
+        let fd = std::os::unix::io::AsRawFd::as_raw_fd(&file);
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert!(
+            flags & libc::O_NONBLOCK != 0,
+            "open_nonblocking must set O_NONBLOCK so opening a FIFO with no \
+             writer can't block, closing the check-then-open race where a \
+             path could be swapped for a FIFO between a metadata check and \
+             a plain File::open"
+        );
+    }
+
+    /// Exercises `read_bounded_regular_file` directly (the function that
+    /// now opens through `open_nonblocking` and does its authoritative
+    /// regular-file check via `file.metadata()` -- an fstat on the
+    /// already-opened descriptor, not a separate pre-open check on the
+    /// path) on a FIFO, proving the open-then-fstat path itself skips a
+    /// FIFO promptly rather than relying solely on a separate, racy,
+    /// path-based pre-check.
+    #[cfg(unix)]
+    #[test]
+    fn read_bounded_regular_file_skips_a_fifo_opened_through_the_new_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("SKILL.md");
+        mkfifo(&path);
+
+        let result = with_timeout(std::time::Duration::from_secs(10), move || {
+            read_bounded_regular_file(&path)
+        });
+        assert!(
+            result.is_none(),
+            "a FIFO opened through open_nonblocking must still be skipped, not read"
         );
     }
 

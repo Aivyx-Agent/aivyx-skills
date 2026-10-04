@@ -10,13 +10,19 @@ publish = false
 
 [dependencies]
 rust-embed = { version = "8.12.0", features = ["debug-embed"] }
+# Light facade, no runtime cost without a subscriber installed; both
+# consumers (aivyx-pa, aivyx-coder) already depend on it, so a warning
+# logged here lands wherever each already sends its own logs, instead of
+# going to raw stderr (which would corrupt aivyx-coder's alternate-screen
+# TUI -- this crate's overlay scan runs on every turn there).
+tracing = "0.1.44"
 
 [dev-dependencies]
 tempfile = "3"
 
-# Unix-only, test-only: used to create a FIFO (`libc::mkfifo`) in
-# loader.rs's bounded-read regression tests. Never affects downstream
-# consumers (aivyx-pa, aivyx-coder) since dev-dependencies aren't part of
-# this crate's dependency graph when used as a library.
-[target.'cfg(unix)'.dev-dependencies]
+# Unix-only: used both by production code (`open_nonblocking` in
+# loader.rs, to open a SKILL.md with O_NONBLOCK so a FIFO can't block the
+# open call) and by test code (`libc::mkfifo`, to create one for the
+# regression tests). Not pulled in on non-Unix targets.
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"

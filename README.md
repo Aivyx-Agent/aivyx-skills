@@ -72,11 +72,15 @@ newline — a file that ends exactly at `---` with no final `\n` is
 accepted (with an empty body), not rejected. Unknown frontmatter fields
 (anything besides `name`/`description`) are tolerated and ignored.
 
-Each overlay `SKILL.md` is only read if it is a regular file (a
-symlink to one is fine; a symlink to a device or a FIFO is skipped, not
-opened) and only up to a 256 KiB cap — see `read_bounded_regular_file`
-in `src/loader.rs`. A skipped entry logs a warning and is simply absent
-from `list()`/`get()`, same as any other malformed overlay skill.
+Each overlay `SKILL.md` is opened non-blocking (`O_NONBLOCK` on Unix, so
+a FIFO with no writer can't block the open call itself) and then only
+*read* if the opened file descriptor's own metadata (an fstat, checked
+after opening — not a separate, racy check on the path beforehand) says
+it's a regular file, up to a 256 KiB cap — see `read_bounded_regular_file`
+in `src/loader.rs`. A symlink to a regular file is fine; a symlink to a
+device, or a FIFO, is opened but never read from. A skipped entry logs a
+`tracing::warn!` and is simply absent from `list()`/`get()`, same as any
+other malformed overlay skill.
 
 ## Known limitations
 
