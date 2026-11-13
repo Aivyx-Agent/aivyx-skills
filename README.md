@@ -1,5 +1,7 @@
 # aivyx-skills
 
+Part of the [Aivyx Ecosystem](https://aivyx-ecosystem.com/building-blocks/): a shared building block of [Aivyx PA](https://aivyx-ecosystem.com/pa/) and [aivyx-coder](https://aivyx-ecosystem.com/coder/).
+
 A default, system-level library of Claude-Skills-format
 (`SKILL.md`) capability packages, shared by both `aivyx-pa` (the flagship
 Personal Assistant) and `aivyx-coder` (the standalone terminal coding
